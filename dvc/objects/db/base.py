@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from typing import TYPE_CHECKING, Optional
 
+from dvc.fs.local import LocalFileSystem
 from dvc.objects.errors import ObjectDBPermissionError, ObjectFormatError
 from dvc.objects.file import HashFile
 from dvc.progress import Tqdm
@@ -75,32 +76,21 @@ class ObjectDB:
             hash_info,
         )
 
-    def add(
-        self,
-        path_info: "AnyPath",
-        fs: "BaseFileSystem",
-        hash_info: "HashInfo",
-        move: bool = True,
-        **kwargs,
-    ):
-        if self.read_only:
-            raise ObjectDBPermissionError("Cannot add to read-only ODB")
-        try:
-            self.check(hash_info, check_hash=self.verify)
-            return
-        except (ObjectFormatError, FileNotFoundError):
-            pass
-
-        cache_info = self.hash_to_path_info(hash_info.value)
-        # using our makedirs to create dirs with proper permissions
-        self.makedirs(cache_info.parent)
-        use_move = isinstance(fs, type(self.fs)) and move
+    def _add_file(self, from_fs, from_info, to_info, move):
+        self.makedirs(to_info.parent)
+        use_move = isinstance(from_fs, type(self.fs)) and move
         try:
             if use_move:
-                self.fs.move(path_info, cache_info)
+                self.fs.move(from_info, to_info)
+            elif isinstance(from_fs, LocalFileSystem):
+                if not isinstance(from_info, from_fs.PATH_CLS):
+                    from_info = from_fs.PATH_CLS(from_info)
+                self.fs.upload(from_info, to_info)
+            elif isinstance(self.fs, LocalFileSystem):
+                from_fs.download_file(from_info, to_info)
             else:
-                with fs.open(path_info, mode="rb") as fobj:
-                    self.fs.upload_fobj(fobj, cache_info)
+                with from_fs.open(from_info, mode="rb") as fobj:
+                    self.fs.upload_fobj(fobj, to_info)
         except OSError as exc:
             # If the target file already exists, we are going to simply
             # ignore the exception (#4992).
@@ -114,14 +104,42 @@ class ObjectDB:
                 and exc.__context__
                 and isinstance(exc.__context__, FileExistsError)
             ):
-                logger.debug("'%s' file already exists, skipping", path_info)
+                logger.debug("'%s' file already exists, skipping", to_info)
                 if use_move:
-                    fs.remove(path_info)
+                    from_fs.remove(from_info)
             else:
                 raise
 
-        self.protect(cache_info)
-        self.state.save(cache_info, self.fs, hash_info)
+    def add(
+        self,
+        path_info: "AnyPath",
+        fs: "BaseFileSystem",
+        hash_info: "HashInfo",
+        move: bool = True,
+        verify: Optional[bool] = None,
+        **kwargs,
+    ):
+        if self.read_only:
+            raise ObjectDBPermissionError("Cannot add to read-only ODB")
+
+        if verify is None:
+            verify = self.verify
+        try:
+            self.check(hash_info, check_hash=verify)
+            return
+        except (ObjectFormatError, FileNotFoundError):
+            pass
+
+        cache_info = self.hash_to_path_info(hash_info.value)
+        # using our makedirs to create dirs with proper permissions
+        self._add_file(fs, path_info, cache_info, move)
+        try:
+            if verify:
+                self.check(hash_info, check_hash=True)
+            self.protect(cache_info)
+            self.state.save(cache_info, self.fs, hash_info)
+        except (ObjectFormatError, FileNotFoundError):
+            pass
 
         callback = kwargs.get("download_callback")
         if callback:
@@ -396,9 +414,7 @@ class ObjectDB:
         """Return list of the specified hashes which exist in this fs.
         Hashes will be queried individually.
         """
-        logger.debug(
-            "Querying {} hashes via object_exists".format(len(hashes))
-        )
+        logger.debug(f"Querying {len(hashes)} hashes via object_exists")
         with Tqdm(
             desc="Querying "
             + ("cache in " + name if name else "remote cache"),
@@ -493,7 +509,7 @@ class ObjectDB:
                 hashes - remote_hashes, jobs, name
             )
 
-        logger.debug("Querying '{}' hashes via traverse".format(len(hashes)))
+        logger.debug(f"Querying '{len(hashes)}' hashes via traverse")
         remote_hashes = set(
             self.list_hashes_traverse(remote_size, remote_hashes, jobs, name)
         )
